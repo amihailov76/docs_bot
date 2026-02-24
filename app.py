@@ -8,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
+
 # --- 1. БЕЗОПАСНОСТЬ ---
 st.set_page_config(page_title="Corporate Doc Assistant", layout="wide")
 
