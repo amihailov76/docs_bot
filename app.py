@@ -4,100 +4,82 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 
 # --- 1. БЕЗОПАСНОСТЬ ---
 st.set_page_config(page_title="Corporate Doc Assistant", layout="wide")
 
 def check_password():
-    def password_entered():
-        if st.session_state["password"] == "SuperSecret123":
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
     if "password_correct" not in st.session_state:
-        st.text_input("Введите пароль доступа", type="password", on_change=password_entered, key="password")
+        st.text_input("Введите пароль", type="password", on_change=lambda: st.session_state.update({"password_correct": st.session_state.password == "SuperSecret123"}), key="password")
         return False
     return st.session_state["password_correct"]
 
-if not check_password():
-    st.stop()
+if not check_password(): st.stop()
 
 # --- 2. ИНИЦИАЛИЗАЦИЯ ---
-if "GOOGLE_API_KEY" in st.secrets:
-    os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
-else:
-    st.error("Настройте GOOGLE_API_KEY в Secrets!")
-    st.stop()
+os.environ["GOOGLE_API_KEY"] = st.secrets.get("GOOGLE_API_KEY", "")
 
 # --- 3. БАЗА ЗНАНИЙ ---
 @st.cache_resource
-def load_knowledge_base():
-    if not os.path.exists("./docs"):
-        os.makedirs("./docs")
+def load_db():
+    if not os.path.exists("./docs"): os.makedirs("./docs")
     loader = DirectoryLoader('./docs', glob="./*.pdf", loader_cls=PyPDFLoader)
-    documents = loader.load()
-    if not documents: return None
+    docs = loader.load()
+    if not docs: return None
+    
+    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(docs)
+    return Chroma.from_documents(chunks, GoogleGenerativeAIEmbeddings(model="models/embedding-001"))
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = text_splitter.split_documents(documents)
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    return Chroma.from_documents(chunks, embeddings)
+vector_store = load_db()
 
-vector_store = load_knowledge_base()
-
-# --- 4. ЛОГИКА ЧАТА (План Б) ---
+# --- 4. ЛОГИКА ЧАТА (LCEL - Прямая сборка) ---
 if vector_store:
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2)
-    
-    # Промпт для переформулирования вопроса с учетом истории
-    context_q_system_prompt = "С учетом истории чата и последнего вопроса пользователя, сформулируй вопрос, который можно понять без истории."
-    context_q_prompt = ChatPromptTemplate.from_messages([
-        ("system", context_q_system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-    
-    retriever = vector_store.as_retriever()
-    history_aware_retriever = create_history_aware_retriever(llm, retriever, context_q_prompt)
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1)
+    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
 
-    # Промпт для финального ответа
-    qa_system_prompt = "Ты технический ассистент. Отвечай на вопросы, используя только предоставленный контекст: {context}"
-    qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", qa_system_prompt),
-        MessagesPlaceholder("chat_history"),
+    # Промпт для генерации ответа
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Ты технический ассистент. Отвечай на основе контекста:\n\n{context}"),
+        MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
     ])
 
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    # Функция для форматирования документов
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
 
-    # Интерфейс чата
+    # Собираем цепочку вручную (без использования langchain.chains)
+    rag_chain = (
+        {"context": retriever | format_docs, "input": RunnablePassthrough(), "chat_history": lambda x: x["chat_history"]}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    # Интерфейс
     if "messages" not in st.session_state: st.session_state.messages = []
     if "chat_history" not in st.session_state: st.session_state.chat_history = []
 
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]): st.markdown(msg["content"])
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]): st.markdown(m["content"])
 
-    if prompt := st.chat_input("Спросите что-нибудь..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"): st.markdown(prompt)
+    if user_input := st.chat_input("Ваш вопрос..."):
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"): st.markdown(user_input)
 
         with st.chat_message("assistant"):
-            result = rag_chain.invoke({"input": prompt, "chat_history": st.session_state.chat_history})
-            answer = result["answer"]
-            st.markdown(answer)
+            # Вызываем цепочку
+            response = rag_chain.invoke({
+                "input": user_input,
+                "chat_history": st.session_state.chat_history
+            })
+            st.markdown(response)
             
-            if result.get('context'):
-                with st.expander("Источники"):
-                    for doc in result['context'][:2]:
-                        st.write(f"Стр. {doc.metadata.get('page')} из {os.path.basename(doc.metadata.get('source'))}")
-
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-        st.session_state.chat_history.append(("human", prompt))
-        st.session_state.chat_history.append(("ai", answer))
+            # Обновляем историю
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            st.session_state.chat_history.extend([("human", user_input), ("ai", response)])
 else:
-    st.warning("Добавьте PDF в папку /docs.")
+    st.info("Добавьте PDF в папку /docs и обновите страницу.")
